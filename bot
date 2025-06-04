@@ -1,0 +1,180 @@
+"""Telegram bot using aiogram3 and Google GenAI (Gemini‑2.5‑Flash‑Preview‑05‑20).
+Features:
+  • ThinkingBudget control
+  • Dynamic temperature & top_p adjustment
+  • Google Custom Search integration (\u200e/search)
+  • Context reset (\u200e/reset)
+  • Image understanding (send photo)
+Environment vars required:
+  BOT_TOKEN           – Telegram Bot token
+  GOOGLE_API_KEY      – Google AI & Programmable Search key
+  GOOGLE_CSE_ID       – Custom Search Engine CX
+"""
+import asyncio
+import logging
+import os
+from io import BytesIO
+from typing import Dict, Any
+
+import google.generativeai as genai
+import httpx
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.utils.chat_action import ChatActionMiddleware
+
+# ---- Logging & basic config --------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GENAI_KEY = os.getenv("GOOGLE_API_KEY")
+CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+if not (BOT_TOKEN and GENAI_KEY):
+    raise RuntimeError("BOT_TOKEN and GOOGLE_API_KEY must be set in env")
+
+genai.configure(api_key=GENAI_KEY)
+
+# ---- Per‑user session storage -------------------------------------------------
+Session = Dict[str, Any]
+user_sessions: Dict[int, Session] = {}
+
+def new_session() -> Session:
+    model = genai.GenerativeModel(
+        "gemini-2.5-flash-preview-05-20",
+        generation_config={
+            "temperature": 0.3,
+            "top_p": 0.9,
+        },
+    )
+    return {
+        "model": model,
+        "chat": model.start_chat(history=[]),
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "thinking_budget": 4096,
+    }
+
+def get_session(uid: int) -> Session:
+    if uid not in user_sessions:
+        user_sessions[uid] = new_session()
+    return user_sessions[uid]
+
+# ---- Google search helper ----------------------------------------------------
+async def google_search(query: str, n: int = 3) -> str:
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"q": query, "key": GENAI_KEY, "cx": CSE_ID, "num": n}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return "Ничего не найдено."
+        return "\n\n".join(f"<b>{it['title']}</b>\n{it['link']}" for it in items)
+
+# ---- Aiogram setup -----------------------------------------------------------
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+dp.message.middleware(ChatActionMiddleware())
+
+# ---- Command handlers --------------------------------------------------------
+@dp.message(Command("start"))
+async def cmd_start(msg: types.Message):
+    await msg.answer(
+        "Привет! Я Gemini‑Flash бот. Просто отправь текст или изображение.\n"
+        "Команды:\n"
+        "/search q – поиск Google\n"
+        "/set_temp 0‑2 – температура\n"
+        "/set_top_p 0‑1 – top_p\n"
+        "/set_budget N – thinkingBudget (0–24576)\n"
+        "/reset – очистить контекст"
+    )
+
+@dp.message(Command("reset"))
+async def cmd_reset(msg: types.Message):
+    user_sessions.pop(msg.from_user.id, None)
+    await msg.answer("Контекст очищен.")
+
+@dp.message(Command("set_temp"))
+async def cmd_set_temp(msg: types.Message, command: Command):
+    try:
+        value = float(command.args)
+        assert 0 <= value <= 2
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите значение 0‑2, например /set_temp 0.7")
+    sess = get_session(msg.from_user.id)
+    sess["temperature"] = value
+    await msg.answer(f"temperature = {value}")
+
+@dp.message(Command("set_top_p"))
+async def cmd_set_top_p(msg: types.Message, command: Command):
+    try:
+        value = float(command.args)
+        assert 0 <= value <= 1
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите значение 0‑1, например /set_top_p 0.8")
+    sess = get_session(msg.from_user.id)
+    sess["top_p"] = value
+    await msg.answer(f"top_p = {value}")
+
+@dp.message(Command("set_budget"))
+async def cmd_set_budget(msg: types.Message, command: Command):
+    try:
+        value = int(command.args)
+        assert 0 <= value <= 24576
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите целое 0‑24576, например /set_budget 4096")
+    sess = get_session(msg.from_user.id)
+    sess["thinking_budget"] = value
+    await msg.answer(f"thinkingBudget = {value}")
+
+@dp.message(Command("search"))
+async def cmd_search(msg: types.Message, command: Command):
+    if not command.args:
+        return await msg.answer("/search <запрос>")
+    await msg.chat.do("typing")
+    result = await google_search(command.args)
+    await msg.answer(result)
+
+# ---- Text & image handler ----------------------------------------------------
+@dp.message(F.photo | F.text)
+async def handle_any(msg: types.Message):
+    sess = get_session(msg.from_user.id)
+    chat = sess["chat"]
+
+    # Build content parts
+    parts = []
+
+    if msg.text:
+        parts.append({"text": msg.text})
+
+    if msg.photo:
+        photo = msg.photo[-1]
+        buf = BytesIO()
+        await bot.download(photo, buf)
+        buf.seek(0)
+        parts.append({"mime_type": "image/jpeg", "data": buf.read()})
+
+    cfg = {
+        "temperature": sess["temperature"],
+        "top_p": sess["top_p"],
+        "thinkingBudget": sess["thinking_budget"],
+    }
+
+    await msg.chat.do("typing")
+    response = chat.send_message(parts, generation_config=cfg)
+
+    thinking = getattr(response, "thinking", None)
+    if thinking:
+        await msg.answer("💭 " + thinking)
+
+    await msg.answer(response.text)
+
+# ---- Main entry --------------------------------------------------------------
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.error("Bot stopped!")
