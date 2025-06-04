@@ -1,1 +1,242 @@
+"""Telegram bot using aiogram3 and Google GenAI (Gemini‑2.5‑Flash‑Preview‑05‑20).
+Features:
+  • ThinkingBudget control
+  • Dynamic temperature & top_p adjustment
+  • Grounding via Google Search
+  • Context reset (\u200e/reset)
+  • Inline settings menu
+  • Image understanding (send photo)
+Environment vars required:
+  BOT_TOKEN           – Telegram Bot token
+  GOOGLE_API_KEY      – Google AI & Programmable Search key
+"""
+import asyncio
+import logging
+import os
+from io import BytesIO
+from typing import Dict, Any
 
+from google import genai
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.utils.chat_action import ChatActionMiddleware
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# ---- Logging & basic config --------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GENAI_KEY = os.getenv("GOOGLE_API_KEY")
+
+if not (BOT_TOKEN and GENAI_KEY):
+    raise RuntimeError("BOT_TOKEN and GOOGLE_API_KEY must be set in env")
+
+client = genai.Client(api_key=GENAI_KEY)
+aio_client = client.aio
+
+# ---- Per‑user session storage -------------------------------------------------
+Session = Dict[str, Any]
+user_sessions: Dict[int, Session] = {}
+
+def new_session() -> Session:
+    chat = aio_client.chats.create(
+        model="gemini-2.5-flash-preview-05-20",
+        config=genai.types.GenerateContentConfig(
+            temperature=0.3,
+            top_p=0.9,
+        ),
+        history=[],
+    )
+    return {
+        "chat": chat,
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "thinking_budget": 4096,
+        "grounding": False,
+        "thinking": True,
+    }
+
+def get_session(uid: int) -> Session:
+    if uid not in user_sessions:
+        user_sessions[uid] = new_session()
+    return user_sessions[uid]
+
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+dp.message.middleware(ChatActionMiddleware())
+
+# ---- Command handlers --------------------------------------------------------
+@dp.message(Command("start"))
+async def cmd_start(msg: types.Message):
+    await msg.answer(
+        "Привет! Я Gemini‑Flash бот. Просто отправь текст или изображение.\n"
+        "Команды:\n"
+        "/set_temp 0‑2 – температура\n"
+        "/set_top_p 0‑1 – top_p\n"
+        "/set_budget N – thinkingBudget (0–24576)\n"
+        "/grounding – вкл/выкл Google Search\n"
+        "/thinking – режим мышления\n"
+        "/menu – настройки через инлайн\n"
+        "/reset – очистить контекст"
+    )
+
+@dp.message(Command("reset"))
+async def cmd_reset(msg: types.Message):
+    user_sessions.pop(msg.from_user.id, None)
+    await msg.answer("Контекст очищен.")
+
+@dp.message(Command("set_temp"))
+async def cmd_set_temp(msg: types.Message, command: Command):
+    try:
+        value = float(command.args)
+        assert 0 <= value <= 2
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите значение 0‑2, например /set_temp 0.7")
+    sess = get_session(msg.from_user.id)
+    sess["temperature"] = value
+    await msg.answer(f"temperature = {value}")
+
+@dp.message(Command("set_top_p"))
+async def cmd_set_top_p(msg: types.Message, command: Command):
+    try:
+        value = float(command.args)
+        assert 0 <= value <= 1
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите значение 0‑1, например /set_top_p 0.8")
+    sess = get_session(msg.from_user.id)
+    sess["top_p"] = value
+    await msg.answer(f"top_p = {value}")
+
+@dp.message(Command("set_budget"))
+async def cmd_set_budget(msg: types.Message, command: Command):
+    try:
+        value = int(command.args)
+        assert 0 <= value <= 24576
+    except (TypeError, ValueError, AssertionError):
+        return await msg.answer("Введите целое 0‑24576, например /set_budget 4096")
+    sess = get_session(msg.from_user.id)
+    sess["thinking_budget"] = value
+    await msg.answer(f"thinkingBudget = {value}")
+
+@dp.message(Command("grounding"))
+async def cmd_grounding(msg: types.Message):
+    sess = get_session(msg.from_user.id)
+    sess["grounding"] = not sess.get("grounding", False)
+    state = "включено" if sess["grounding"] else "выключено"
+    await msg.answer(f"Grounding {state}")
+
+@dp.message(Command("thinking"))
+async def cmd_thinking(msg: types.Message):
+    sess = get_session(msg.from_user.id)
+    sess["thinking"] = not sess.get("thinking", True)
+    state = "включен" if sess["thinking"] else "выключен"
+    await msg.answer(f"Режим мышления {state}")
+
+@dp.message(Command("menu"))
+async def cmd_menu(msg: types.Message):
+    sess = get_session(msg.from_user.id)
+    await msg.answer("Настройки:", reply_markup=_build_menu(sess))
+
+def _build_menu(sess: Session) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"T- ({sess['temperature']:.1f})", callback_data="temp_dec")
+    kb.button(text=f"T+ ({sess['temperature']:.1f})", callback_data="temp_inc")
+    kb.button(text=f"P- ({sess['top_p']:.1f})", callback_data="top_dec")
+    kb.button(text=f"P+ ({sess['top_p']:.1f})", callback_data="top_inc")
+    kb.button(text=f"Grounding {'✅' if sess['grounding'] else '❌'}", callback_data="toggle_grounding")
+    kb.button(text=f"Thinking {'✅' if sess['thinking'] else '❌'}", callback_data="toggle_thinking")
+    kb.button(text="Reset", callback_data="reset_ctx")
+    kb.adjust(2,2,2)
+    return kb.as_markup()
+
+@dp.callback_query(lambda c: c.data in {"temp_inc","temp_dec","top_inc","top_dec","toggle_grounding","toggle_thinking","reset_ctx"})
+async def callbacks(call: types.CallbackQuery):
+    sess = get_session(call.from_user.id)
+    if call.data == "temp_inc":
+        sess["temperature"] = min(2.0, sess["temperature"] + 0.1)
+        await call.answer(f"temperature = {sess['temperature']:.1f}")
+    elif call.data == "temp_dec":
+        sess["temperature"] = max(0.0, sess["temperature"] - 0.1)
+        await call.answer(f"temperature = {sess['temperature']:.1f}")
+    elif call.data == "top_inc":
+        sess["top_p"] = min(1.0, sess["top_p"] + 0.1)
+        await call.answer(f"top_p = {sess['top_p']:.1f}")
+    elif call.data == "top_dec":
+        sess["top_p"] = max(0.0, sess["top_p"] - 0.1)
+        await call.answer(f"top_p = {sess['top_p']:.1f}")
+    elif call.data == "toggle_grounding":
+        sess["grounding"] = not sess.get("grounding", False)
+        state = "включено" if sess["grounding"] else "выключено"
+        await call.answer(f"Grounding {state}")
+    elif call.data == "toggle_thinking":
+        sess["thinking"] = not sess.get("thinking", True)
+        state = "включен" if sess["thinking"] else "выключен"
+        await call.answer(f"Режим мышления {state}")
+    elif call.data == "reset_ctx":
+        user_sessions.pop(call.from_user.id, None)
+        sess = get_session(call.from_user.id)
+        await call.answer("Контекст очищен")
+    await call.message.edit_reply_markup(_build_menu(sess))
+# ---- Text & image handler ----------------------------------------------------
+@dp.message(F.photo | F.text)
+async def handle_any(msg: types.Message):
+    sess = get_session(msg.from_user.id)
+    chat = sess["chat"]
+
+    # Build content parts
+    parts = []
+
+    if msg.text:
+        parts.append(genai.types.Part.from_text(msg.text))
+
+    if msg.photo:
+        photo = msg.photo[-1]
+        buf = BytesIO()
+        await bot.download(photo, buf)
+        buf.seek(0)
+        parts.append(genai.types.Part.from_bytes(buf.read(), mime_type="image/jpeg"))
+
+    cfg = genai.types.GenerateContentConfig(
+        temperature=sess["temperature"],
+        top_p=sess["top_p"],
+        thinking_config=genai.types.ThinkingConfig(
+            include_thoughts=True,
+            thinking_budget=sess["thinking_budget"],
+        ),
+    )
+
+    tools = None
+    if sess.get("grounding"):
+        tools = [
+            genai.types.Tool(
+                google_search_retrieval=genai.types.GoogleSearchRetrieval(
+                    dynamic_retrieval_config=genai.types.DynamicRetrievalConfig(
+                        mode=genai.types.DynamicRetrievalConfigMode.MODE_DYNAMIC
+                    )
+                )
+            )
+        ]
+
+    await msg.chat.do("typing")
+    response = await chat.send_message(parts, config=cfg, tools=tools)
+
+    if sess.get("thinking") and response.candidates:
+        thoughts = []
+        for p in response.candidates[0].content.parts:
+            if getattr(p, "thought", False) and isinstance(p.text, str):
+                thoughts.append(p.text)
+        if thoughts:
+            await msg.answer("\n".join("💭 " + t for t in thoughts))
+
+    if response.text:
+        await msg.answer(response.text)
+
+# ---- Main entry --------------------------------------------------------------
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.error("Bot stopped!")
